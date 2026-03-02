@@ -226,6 +226,8 @@ class Sonata(PointModel):
         )
         self.momentum_scheduler.iter = curr_step
 
+        
+
     def before_step(self):
         # update parameters from schedulers
         self.mask_size = self.mask_size_scheduler.step()
@@ -297,6 +299,8 @@ class Sonata(PointModel):
 
         # Grouping points with grid patch
         min_coord = torch_scatter.segment_coo(coord, batch, reduce="min")
+
+        
         grid_coord = ((coord - min_coord[batch]) // mask_size).int()
         grid_coord = torch.cat([batch.unsqueeze(-1), grid_coord], dim=-1)
         unique, point_cluster, counts = torch.unique(
@@ -369,9 +373,8 @@ class Sonata(PointModel):
                 point = parent
             return dict(point=point)
 
-        # prepare global_point, mask_global_point, local_point
+        # Get global point cloud. Shape = N,3
         with torch.no_grad():
-            # global_point & masking
             global_point = Point(
                 feat=data_dict["global_feat"],
                 coord=data_dict["global_coord"],
@@ -379,9 +382,12 @@ class Sonata(PointModel):
                 offset=data_dict["global_offset"],
                 grid_size=data_dict["grid_size"][0],
             )
+            # Generate global Mask. Shape = aN,3
             global_mask, global_cluster = self.generate_mask(
                 global_point.coord, global_point.offset
             )
+
+            # Create masked duplicate and apply augmentation. Shape = aN,3
             mask_global_coord = global_point.coord.clone().detach()
             if self.mask_jitter is not None:
                 mask_global_coord[global_mask] += torch.clip(
@@ -391,6 +397,7 @@ class Sonata(PointModel):
                     max=self.mask_jitter * 2,
                 )
 
+            # Create masked duplicate and apply augmentation. Shape = aN,3
             mask_global_point = Point(
                 feat=data_dict["global_feat"],
                 coord=mask_global_coord,
@@ -400,7 +407,7 @@ class Sonata(PointModel):
                 grid_size=data_dict["grid_size"][0],
             )
 
-            # local point & matching
+            # Get local point cloud. Shape = bN,3
             local_point = Point(
                 feat=data_dict["local_feat"],
                 coord=data_dict["local_coord"],
@@ -409,37 +416,41 @@ class Sonata(PointModel):
                 grid_size=data_dict["grid_size"][0],
             )
 
-            # create result dictionary for return
-            result_dict = dict(loss=[])
-            # teacher backbone forward (shared with mask and unmask)
+            # Forward point cloud space with teacher backbone to obtain feature space with shape N,1016
+            # Remember, no gradients are computed here
             global_point_ = self.teacher.backbone(global_point)
             global_point_ = self.up_cast(global_point_)
             global_feat = global_point_.feat
 
+            # create result dictionary for return
+            result_dict = dict(loss=[])
+        
         if self.mask_loss_weight > 0 or self.roll_mask_loss_weight > 0:
-            # teacher head forward
+            # Put point cloud space through teacher head
             with torch.no_grad():
                 global_point_.feat = self.teacher.mask_head(global_feat)
-            # student forward
+
+            # Put global mask through student backbone and head
             mask_global_point_ = self.student.backbone(mask_global_point)
             mask_global_point_ = self.up_cast(mask_global_point_)
             mask_pred_sim = self.student.mask_head(mask_global_point_.feat)
 
             if self.mask_loss_weight > 0:
                 with torch.no_grad():
+                    # Matching coords of global mask and point cloud space
                     match_index = self.match_neighbour(
                         mask_global_point_.origin_coord,
                         mask_global_point_.offset,
                         global_point_.origin_coord,
                         global_point_.offset,
                     )
-                    # teacher forward
+                    # Compute loss of features from point cloud space corresponding to global mask
                     mask_target_sim = self.sinkhorn_knopp(
                         global_point_.feat[match_index[:, 1]],
                         self.teacher_temp,
                     )
 
-                # loss
+                # Compute with gradients loss by summing sinkhorn_knopp of features from point cloud space corresponding to global mask. Shape = aN,1 ?
                 mask_loss = -torch.sum(
                     mask_target_sim
                     * F.log_softmax(
@@ -447,15 +458,22 @@ class Sonata(PointModel):
                     ),
                     dim=-1,
                 )
+                # What does this do ?
                 mask_loss = torch_scatter.segment_coo(
                     mask_loss,
                     index=mask_global_point_.batch[match_index[:, 0]],
                     reduce="mean",
                 ).mean()
+
+                # "The" mask loss is computed
                 result_dict["mask_loss"] = mask_loss
+                
+                # But loss is only appended, why ?
                 result_dict["loss"].append(mask_loss * self.mask_loss_weight)
 
+            # Why is roll_mask_loss_weigtht needed ???
             if self.roll_mask_loss_weight > 0:
+                # Transformed to bincount ?
                 roll_global_point_ = self.roll_point(global_point_)
                 with torch.no_grad():
                     # match index for pred and roll target
@@ -465,7 +483,7 @@ class Sonata(PointModel):
                         roll_global_point_.origin_coord,
                         roll_global_point_.offset,
                     )
-                    # teacher forward
+                    # Is identical to line 436
                     roll_mask_target_sim = self.sinkhorn_knopp(
                         roll_global_point_.feat[match_index[:, 1]],
                         self.teacher_temp,
@@ -486,7 +504,7 @@ class Sonata(PointModel):
                 result_dict["roll_mask_loss"] = roll_mask_loss
                 result_dict["loss"].append(roll_mask_loss * self.roll_mask_loss_weight)
         if self.unmask_loss_weight > 0:
-            # teacher head forward
+            # Replace the features from teacher backbone with that of teacher unmask head
             with torch.no_grad():
                 global_point_.feat = self.teacher.unmask_head(global_feat)
             # student forward
